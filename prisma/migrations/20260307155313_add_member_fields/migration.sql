@@ -1,0 +1,16 @@
+-- AlterTable
+ALTER TABLE "Member" ADD COLUMN     "area" TEXT,
+ADD COLUMN     "brand" TEXT,
+ADD COLUMN     "businessItems" TEXT,
+ADD COLUMN     "city" TEXT,
+ADD COLUMN     "companyPhone" TEXT,
+ADD COLUMN     "contactPerson" TEXT,
+ADD COLUMN     "contactPhone" TEXT,
+ADD COLUMN     "currentPosition" TEXT,
+ADD COLUMN     "education" TEXT,
+ADD COLUMN     "experience" TEXT,
+ADD COLUMN     "fax" TEXT,
+ADD COLUMN     "gender" TEXT,
+ADD COLUMN     "introduction" TEXT,
+ADD COLUMN     "jobTitle" TEXT,
+ADD COLUMN     "website" TEXT;

@@ -1,0 +1,880 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================
+// 會員相關
+// ============================================
+
+model Member {
+  id            Int       @id @default(autoincrement())
+  account       String    @unique // 期別+學號 (如 41086, CY0137)
+  password      String    // bcrypt hashed
+  name          String
+  email         String?
+  phone         String?
+  avatar        String?   // 頭像圖片路徑
+  birthday      DateTime?
+  gender        String?   // 性別（男/女）
+  company       String?   // 公司名稱
+  jobTitle      String?   // 公司職稱
+  industry      String?   // 產業別（如 C1-食品及飼品製造業）
+  businessItems String?   // 營業項目
+  brand         String?   // 經營品牌
+  website       String?   // 公司網址
+  companyPhone  String?   // 公司電話
+  fax           String?   // 傳真
+  address       String?   // 聯絡地址
+  city          String?   // 城市（APP 自填）
+  area          String?   // 行政區（APP 自填）
+  contactPerson String?   // 聯絡人（APP 自填）
+  contactPhone  String?   // 聯絡電話（APP 自填）
+  introduction  String?   // 介紹（APP 自填）
+  education     String?   // 學歷（APP 自填）
+  experience    String?   // 經歷（APP 自填）
+  currentPosition String? // 現職（APP 自填）
+  privacySettings String?  @db.Text // JSON: 各欄位隱私設定 (true=公開, false=隱藏)
+  memberType    MemberType @default(GENERAL) // GENERAL or CY (建青團)
+  termNumber    Int?      // 期別數字（可空，批次建立後再設定）
+  studentNumber Int?      // 學號數字（可空）
+  paymentYears  Int       @default(0)  // 繳費年資（累計繳費次數）
+  districtId    Int?      // 所屬地區
+  resetCode       String?    // 密碼重設驗證碼
+  resetCodeExpiry DateTime?  // 驗證碼到期時間
+  isActive      Boolean   @default(true)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  // Relations
+  district          District?          @relation(fields: [districtId], references: [id])
+  specialDistricts  MemberSpecialDistrict[]
+  organizationRoles MemberOrganizationRole[]
+  bills             Bill[]
+  eventRegistrations EventRegistration[]
+  checkins          Checkin[]
+  points            PointRecord[]
+  photos            Photo[]
+  photoTags         PhotoTag[]
+  follows           Follow[]           @relation("follower")
+  followers         Follow[]           @relation("following")
+  preferences       MemberPreference?
+  pushTokens        PushToken[]
+  pushReadStatus    PushReadStatus?
+  pointRedemptions  PointRedemption[]
+  stores            Store[]
+  candidates        Candidate[]
+  votes             Vote[]
+
+  @@index([districtId])
+  @@index([termNumber])
+  @@index([memberType])
+  @@index([name])
+  @@index([company])
+  @@index([industry])
+}
+
+enum MemberType {
+  GENERAL // 一般會員
+  CY      // 建青團
+}
+
+// ============================================
+// 地區與特別區
+// ============================================
+
+model District {
+  id        Int          @id @default(autoincrement())
+  name      String       @unique // 北區, 中區, 南區, 東區
+  type      DistrictType @default(REGIONAL)
+  createdAt DateTime     @default(now())
+
+  members              Member[]
+  admins               Admin[]
+  billingBatches       BillingBatch[]
+  events               Event[]
+  specialDistrictMembers MemberSpecialDistrict[]
+}
+
+enum DistrictType {
+  REGIONAL  // 地區分會 (北中南東)
+  SPECIAL   // 特別區 (大港湖, 新三五...)
+}
+
+// 會員-特別區 多對多
+model MemberSpecialDistrict {
+  id         Int      @id @default(autoincrement())
+  memberId   Int
+  districtId Int
+  createdAt  DateTime @default(now())
+
+  member   Member   @relation(fields: [memberId], references: [id])
+  district District @relation(fields: [districtId], references: [id])
+
+  @@unique([memberId, districtId])
+}
+
+// ============================================
+// 管理者
+// ============================================
+
+model Admin {
+  id         Int       @id @default(autoincrement())
+  username   String    @unique
+  password   String    // bcrypt hashed
+  name       String
+  role       AdminRole @default(DISTRICT)
+  districtId Int?      // 地區管理者所屬地區
+  termNumber Int?      // 期別管理者所屬期別
+  memberType MemberType? // 建青團管理者
+  isActive   Boolean   @default(true)
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  district       District?      @relation(fields: [districtId], references: [id])
+  billingBatches BillingBatch[]
+}
+
+enum AdminRole {
+  SUPER     // 總管理者
+  DISTRICT  // 地區管理者
+  TERM      // 期別管理者
+  SPECIAL   // 特別區管理者
+  CY_TERM   // 建青團期別管理者
+}
+
+// ============================================
+// 組織架構
+// ============================================
+
+model OrganizationGroup {
+  id        Int               @id @default(autoincrement())
+  name      String            // 北區聯誼會, 第41期聯誼會, 醫療生技委員會...
+  groupType OrganizationGroupType // 大分類
+  year      Int?              // 年度（委員會用，聯誼會可不填）
+  parentId  Int?              // 父層組織（如 北區 → 北區下的子組織）
+  createdAt DateTime          @default(now())
+
+  parent   OrganizationGroup?  @relation("OrgGroupHierarchy", fields: [parentId], references: [id])
+  children OrganizationGroup[] @relation("OrgGroupHierarchy")
+  roles    MemberOrganizationRole[]
+
+  @@unique([name, groupType])
+  @@index([parentId])
+}
+
+enum OrganizationGroupType {
+  HEAD       // 總會（本屆理事會/監事會/總會幹部/歷屆理事長）
+  REGIONAL   // 四區聯誼會（北/中/南/東）
+  TERM       // 各期別聯誼會（1~42期）
+  COMMITTEE  // 工作委員會（10個）
+  CY         // 建青團（1~11期）
+  LOCAL      // 地方聯誼會/特別區（大港湖/新三五/桃竹）
+}
+
+model OrganizationPosition {
+  id        Int      @id @default(autoincrement())
+  name      String   // 自由輸入：主任委員, 副主任委員, 委員, 會長...
+  createdAt DateTime @default(now())
+
+  roles MemberOrganizationRole[]
+}
+
+model MemberOrganizationRole {
+  id         Int      @id @default(autoincrement())
+  memberId   Int
+  groupId    Int
+  positionId Int
+  year       Int      // 任期年度
+  createdAt  DateTime @default(now())
+
+  member   Member               @relation(fields: [memberId], references: [id])
+  group    OrganizationGroup    @relation(fields: [groupId], references: [id])
+  position OrganizationPosition @relation(fields: [positionId], references: [id])
+
+  @@index([memberId])
+  @@index([year])
+}
+
+// ============================================
+// 繳費系統
+// ============================================
+
+model BillingBatch {
+  id          Int              @id @default(autoincrement())
+  title       String           // 如「2026 總會年費」
+  amount      Decimal          @db.Decimal(10, 2)
+  billingType BillingType      @default(ANNUAL) // 繳費名目
+  targetType  BillingTargetType // 發行對象類型
+  districtId  Int?             // 地區發行時的地區ID
+  termNumber  Int?             // 期別發行時的期別
+  memberType  MemberType?      // 建青團
+  note        String?          // 備註
+  startDate   DateTime         // 繳費開放日
+  endDate     DateTime         // 繳費截止日
+  status      BatchStatus      @default(ACTIVE)
+  createdById Int              // 建立者 Admin ID
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
+
+  district  District? @relation(fields: [districtId], references: [id])
+  createdBy Admin     @relation(fields: [createdById], references: [id])
+  bills     Bill[]
+
+  @@index([targetType])
+  @@index([status])
+}
+
+enum BillingTargetType {
+  GENERAL     // 總會
+  DISTRICT    // 地區
+  TERM        // 期別
+  SPECIAL     // 特別區
+  CY          // 建青團
+}
+
+enum BillingType {
+  ANNUAL      // 年費
+  ENROLLMENT  // 入會費
+  OTHER       // 其他
+}
+
+enum BatchStatus {
+  ACTIVE    // 進行中
+  CLOSED    // 已截止
+}
+
+model Bill {
+  id             Int           @id @default(autoincrement())
+  batchId        Int
+  memberId       Int
+  amount         Decimal       @db.Decimal(10, 2)
+  status         BillStatus    @default(UNPAID)
+  paymentMethod  PaymentMethod?
+  paymentDate    DateTime?
+  bankAccount    String?       // 帳號後五碼
+  transferTime   DateTime?     // 匯款時間
+  receiptUrl     String?       // 付款憑證
+  operatorName   String?       // 經辦人（手動入帳時）
+  isCrossDistrict   Boolean    @default(false) // 跨區繳費標籤
+  targetDistrictId  Int?       // 跨區繳費的目標地區 ID
+  note              String?
+  ecpayTradeNo   String?       // 綠界交易編號
+  ecpayPayInfo   Json?         // ATM 虛擬帳號 / 超商代碼等待付款資訊
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  batch  BillingBatch @relation(fields: [batchId], references: [id])
+  member Member       @relation(fields: [memberId], references: [id])
+
+  @@index([batchId])
+  @@index([memberId])
+  @@index([status])
+  @@index([batchId, status])
+  @@index([memberId, status])
+}
+
+enum BillStatus {
+  UNPAID    // 未繳費
+  PAID      // 已繳費（線上）
+  MANUAL    // 已繳費（人工）
+  OVERDUE   // 逾期
+  VOIDED    // 已作廢
+}
+
+enum PaymentMethod {
+  ECPAY       // 綠界線上
+  BANK        // 銀行匯款
+  CASH        // 現金
+  CHECK       // 支票
+}
+
+// ============================================
+// 活動系統
+// ============================================
+
+model Event {
+  id            Int              @id @default(autoincrement())
+  title         String
+  description   String?          @db.Text
+  coverImage    String?          // 活動封面圖
+  targetType    EventTargetType  // 活動對象類型
+  districtId    Int?
+  termNumber    Int?
+  startTime     DateTime         // 活動開始時間
+  endTime       DateTime?        // 活動結束時間
+  location      String?          // 活動地點名稱
+  address       String?          // 活動地址
+  maxParticipants Int?           // 人數上限 (null = 不限)
+  registrationDeadline DateTime? // 報名截止時間
+  requirePayment Boolean         @default(false) // 需繳費才能參加
+  isFreeOpen     Boolean         @default(false) // 免費開放
+  allowCrossDistrict Boolean     @default(false) // 允許跨區報名
+  points        Int              @default(0) // 簽到可獲得點數 (0=無點數)
+  qrCode        String?          @unique // 活動專屬 QR Code
+  status        EventStatus      @default(DRAFT)
+  createdAt     DateTime         @default(now())
+  updatedAt     DateTime         @updatedAt
+
+  district      District?          @relation(fields: [districtId], references: [id])
+  formFields    EventFormField[]
+  registrations EventRegistration[]
+  checkins      Checkin[]
+  highlights    EventHighlight[]
+  pointRecords  PointRecord[]
+
+  @@index([status])
+  @@index([startTime])
+  @@index([status, startTime])
+  @@index([targetType, districtId])
+}
+
+enum EventTargetType {
+  GENERAL     // 總會
+  DISTRICT    // 地區
+  TERM        // 期別
+  SPECIAL     // 特別區
+  CY          // 建青團
+}
+
+enum EventStatus {
+  DRAFT       // 籌備中（APP 不顯示）
+  OPEN        // 報名中
+  CLOSED      // 報名截止
+  ONGOING     // 活動進行中
+  ENDED       // 活動結束
+  CANCELLED   // 已取消（APP 不顯示）
+}
+
+// 動態報名表欄位
+model EventFormField {
+  id         Int           @id @default(autoincrement())
+  eventId    Int
+  fieldName  String        // 欄位名稱 (如「是否素食」)
+  fieldType  FormFieldType
+  isRequired Boolean       @default(false)
+  options    String?       // 選擇題選項 (JSON array)
+  sortOrder  Int           @default(0)
+
+  event   Event                    @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  answers EventRegistrationAnswer[]
+
+  @@index([eventId])
+}
+
+enum FormFieldType {
+  SELECT    // 選擇
+  TEXT      // 簡答題
+  NUMBER    // 數字
+  DATE      // 日期
+  IMAGE     // 圖片上傳
+  YOUTUBE   // YouTube 連結
+}
+
+model EventRegistration {
+  id        Int      @id @default(autoincrement())
+  eventId   Int
+  memberId  Int
+  status    RegistrationStatus @default(REGISTERED)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  event   Event                    @relation(fields: [eventId], references: [id])
+  member  Member                   @relation(fields: [memberId], references: [id])
+  answers EventRegistrationAnswer[]
+
+  @@unique([eventId, memberId])
+}
+
+enum RegistrationStatus {
+  REGISTERED  // 已報名
+  CANCELLED   // 已取消
+}
+
+model EventRegistrationAnswer {
+  id             Int    @id @default(autoincrement())
+  registrationId Int
+  fieldId        Int
+  answer         String @db.Text
+
+  registration EventRegistration @relation(fields: [registrationId], references: [id], onDelete: Cascade)
+  field        EventFormField    @relation(fields: [fieldId], references: [id])
+
+  @@index([registrationId])
+}
+
+// 活動花絮
+model EventHighlight {
+  id        Int      @id @default(autoincrement())
+  eventId   Int
+  imageUrl  String
+  caption   String?
+  createdAt DateTime @default(now())
+
+  event Event @relation(fields: [eventId], references: [id])
+
+  @@index([eventId])
+}
+
+// ============================================
+// 簽到系統
+// ============================================
+
+model Checkin {
+  id        Int      @id @default(autoincrement())
+  eventId   Int
+  memberId  Int
+  checkinAt DateTime @default(now())
+
+  event  Event  @relation(fields: [eventId], references: [id])
+  member Member @relation(fields: [memberId], references: [id])
+
+  @@unique([eventId, memberId]) // 不可重複簽到
+}
+
+// ============================================
+// 點數系統
+// ============================================
+
+model PointRecord {
+  id        Int         @id @default(autoincrement())
+  memberId  Int
+  points    Int
+  type      PointType
+  source    String?     // 來源說明 (活動名稱 or 人工送點原因)
+  eventId   Int?        // 關聯活動
+  expiresAt DateTime    // 到期時間
+  createdAt DateTime    @default(now())
+
+  member Member @relation(fields: [memberId], references: [id])
+  event  Event? @relation(fields: [eventId], references: [id])
+
+  @@index([memberId])
+  @@index([eventId])
+  @@index([expiresAt])
+}
+
+enum PointType {
+  CHECKIN   // 簽到獲得
+  MANUAL    // 人工送點
+  REDEEM    // 兌換扣除 (負值)
+}
+
+model ProductCategory {
+  id        Int      @id @default(autoincrement())
+  name      String   @unique
+  sortOrder Int      @default(0)
+  isActive  Boolean  @default(true) // 上下架
+  createdAt DateTime @default(now())
+
+  products RedeemProduct[]
+}
+
+model RedeemProduct {
+  id          Int            @id @default(autoincrement())
+  categoryId  Int?
+  name        String
+  description String?        @db.Text // 內文設定
+  imageUrl    String?
+  pointCost   Int            // 所需點數
+  stock       Int            @default(0) // 庫存數
+  redeemCount Int            @default(0) // 兌換次數
+  sortOrder   Int            @default(0) // 排序
+  status      ProductStatus  @default(ACTIVE)
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+
+  category    ProductCategory? @relation(fields: [categoryId], references: [id])
+  redemptions PointRedemption[]
+
+  @@index([categoryId])
+  @@index([status])
+  @@index([sortOrder])
+}
+
+enum ProductStatus {
+  ACTIVE    // 上架
+  INACTIVE  // 下架
+}
+
+model PointRedemption {
+  id        Int      @id @default(autoincrement())
+  memberId  Int
+  productId Int
+  points    Int      // 扣除點數
+  createdAt DateTime @default(now())
+
+  member  Member        @relation(fields: [memberId], references: [id])
+  product RedeemProduct @relation(fields: [productId], references: [id])
+
+  @@index([memberId])
+}
+
+// ============================================
+// 會員專區 — 照片 / 關注
+// ============================================
+
+model Photo {
+  id        Int      @id @default(autoincrement())
+  memberId  Int      // 上傳者
+  imageUrl  String
+  caption   String?
+  createdAt DateTime @default(now())
+
+  member Member     @relation(fields: [memberId], references: [id])
+  tags   PhotoTag[]
+
+  @@index([memberId])
+}
+
+model PhotoTag {
+  id       Int @id @default(autoincrement())
+  photoId  Int
+  memberId Int // 被標註的會員
+
+  photo  Photo  @relation(fields: [photoId], references: [id], onDelete: Cascade)
+  member Member @relation(fields: [memberId], references: [id])
+
+  @@unique([photoId, memberId])
+}
+
+model Follow {
+  id          Int      @id @default(autoincrement())
+  followerId  Int      // 關注者
+  followingId Int      // 被關注者
+  createdAt   DateTime @default(now())
+
+  follower  Member @relation("follower", fields: [followerId], references: [id])
+  following Member @relation("following", fields: [followingId], references: [id])
+
+  @@unique([followerId, followingId])
+}
+
+// ============================================
+// 會員偏好 (AI 摘要用)
+// ============================================
+
+model MemberPreference {
+  id          Int      @id @default(autoincrement())
+  memberId    Int      @unique
+  interests   String?  @db.Text // JSON array: 主題（最多3）
+  industries  String?  @db.Text // JSON array: 產業（最多3）
+  perspective String?  // 單選閱讀角度
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  member Member @relation(fields: [memberId], references: [id])
+}
+
+// ============================================
+// RSS 新聞來源
+// ============================================
+
+model RssSource {
+  id        Int      @id @default(autoincrement())
+  name      String   // 來源名稱：CNN Business, 經濟日報...
+  url       String   // RSS Feed URL
+  region    String   // INTERNATIONAL 或 DOMESTIC
+  category  String?  // 分類標籤
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  articles RssArticle[]
+
+  @@index([region])
+  @@index([isActive])
+}
+
+// ============================================
+// RSS 抓取的原始文章（素材池）
+// ============================================
+
+model RssArticle {
+  id          Int      @id @default(autoincrement())
+  sourceId    Int
+  title       String
+  content     String?  @db.Text // 文章內容或描述
+  url         String   // 原文連結
+  publishedAt DateTime // 原文發佈時間
+  fetchedAt   DateTime @default(now())
+
+  source RssSource @relation(fields: [sourceId], references: [id], onDelete: Cascade)
+
+  @@unique([url]) // 同一篇文章不重複抓
+  @@index([sourceId])
+  @@index([publishedAt])
+}
+
+// ============================================
+// AI 新聞摘要（依會員偏好組合生成）
+// ============================================
+
+model AiDigest {
+  id           Int      @id @default(autoincrement())
+  comboKey     String   // 偏好組合 hash key（相同組合共用）
+  region       String   // INTERNATIONAL 或 DOMESTIC
+  interests    String   @db.Text // JSON: 生成時的主題組合
+  industries   String   @db.Text // JSON: 生成時的產業組合
+  perspective  String   // 生成時的角度
+  title        String
+  summary      String   @db.Text
+  sourceUrls   String?  @db.Text // JSON: 引用的原文連結列表
+  publishDate  DateTime @default(now())
+  createdAt    DateTime @default(now())
+
+  @@unique([comboKey, region, publishDate])
+  @@index([comboKey])
+  @@index([publishDate])
+  @@index([region])
+}
+
+// ============================================
+// 新聞消息
+// ============================================
+
+model News {
+  id        Int          @id @default(autoincrement())
+  title     String
+  content   String       @db.Text // 富文本 HTML
+  category  NewsCategory
+  imageUrl  String?      // 封面圖
+  isDeleted Boolean      @default(false) // 軟刪除
+  createdAt DateTime     @default(now())
+  updatedAt DateTime     @updatedAt
+
+  @@index([category])
+  @@index([createdAt])
+  @@index([isDeleted])
+}
+
+enum NewsCategory {
+  EVENT     // 活動消息
+  ANNOUNCE  // 公告
+  INDUSTRY  // 產業新聞
+}
+
+// ============================================
+// 廣告模組
+// ============================================
+
+model Ad {
+  id          Int      @id @default(autoincrement())
+  title       String
+  imageUrl    String
+  linkUrl     String?  // 點擊連結
+  startDate   DateTime // 上架時間
+  endDate     DateTime // 下架時間
+  isActive    Boolean  @default(true)
+  sortOrder   Int      @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([startDate, endDate])
+}
+
+// ============================================
+// 優惠店家
+// ============================================
+
+model Store {
+  id          Int      @id @default(autoincrement())
+  memberId    Int      // 店家擁有者（會員）
+  name        String   // 店家名稱
+  description String?  @db.Text
+  address     String?
+  phone       String?
+  latitude    Float?
+  longitude   Float?
+  imageUrl    String?  // 店家照片
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  member Member       @relation(fields: [memberId], references: [id])
+  offers StoreOffer[]
+
+  @@index([memberId])
+  @@index([name])
+  @@index([address])
+}
+
+model StoreOffer {
+  id          Int      @id @default(autoincrement())
+  storeId     Int
+  title       String
+  description String?
+  imageUrl    String?
+  extraInfo   String?  @db.Text // 其他優惠資訊或圖片
+  createdAt   DateTime @default(now())
+
+  store Store @relation(fields: [storeId], references: [id], onDelete: Cascade)
+
+  @@index([storeId])
+}
+
+// ============================================
+// 推播紀錄
+// ============================================
+
+model PushNotification {
+  id          Int          @id @default(autoincrement())
+  title       String
+  body        String       @db.Text
+  targetType  PushTarget
+  targetId    Int?         // 活動ID 或 地區ID
+  targetValue String?      // 會員帳號 或 期別數字（輔助顯示用）
+  scheduledAt DateTime?    // 排程時間 (null=立即發送)
+  sentAt      DateTime?    // 實際發送時間
+  status      PushStatus   @default(PENDING)
+  createdAt   DateTime     @default(now())
+
+  @@index([status])
+  @@index([scheduledAt])
+}
+
+enum PushTarget {
+  ALL        // 全體
+  EVENT      // 活動參加者
+  DISTRICT   // 地區
+  MEMBER     // 指定會員
+  TERM       // 指定期別
+  CY_TERM    // 建青團期別
+}
+
+enum PushStatus {
+  PENDING    // 待發送
+  SENT       // 已發送
+  FAILED     // 發送失敗
+  SCHEDULED  // 已排程
+}
+
+model PushToken {
+  id        Int      @id @default(autoincrement())
+  memberId  Int
+  token     String   // FCM token
+  platform  String   // iOS / Android
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  member Member @relation(fields: [memberId], references: [id])
+
+  @@index([memberId])
+}
+
+// 會員推播已讀紀錄（用最後讀取時間計算未讀數）
+model PushReadStatus {
+  id             Int       @id @default(autoincrement())
+  memberId       Int       @unique
+  lastReadAt     DateTime  @default(now()) // 最後讀取推播的時間
+  clearedAt      DateTime? // 全部清除的時間點，APP 只顯示此時間之後的推播
+  dismissedIds   String    @default("[]") // JSON array of dismissed push IDs
+
+  member Member @relation(fields: [memberId], references: [id])
+}
+
+// ============================================
+// 投票 / 選舉
+// ============================================
+
+model Election {
+  id          Int            @id @default(autoincrement())
+  title       String         // 選舉名稱（如「第42屆理事長選舉」）
+  description String?        @db.Text
+  type        ElectionType   @default(SINGLE) // 單選 / 多選
+  maxVotes    Int            @default(1)      // 多選時最多可投幾票
+  status      ElectionStatus @default(DRAFT)
+  startTime   DateTime       // 投票開始
+  endTime     DateTime       // 投票截止
+  targetType  ElectionTarget @default(ALL) // 投票對象範圍
+  targetId    Int?           // 若為 DISTRICT/TERM，指定 ID
+  requirePayment Boolean     @default(true) // 是否需已繳會費才能投票
+  isAnonymous    Boolean     @default(false) // 匿名投票（不公開誰投了誰）
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+
+  candidates  Candidate[]
+  votes       Vote[]
+
+  @@index([status])
+  @@index([startTime])
+}
+
+enum ElectionType {
+  SINGLE   // 單選
+  MULTIPLE // 多選（maxVotes 控制上限）
+}
+
+enum ElectionStatus {
+  DRAFT    // 草稿
+  OPEN     // 投票中
+  CLOSED   // 已截止
+  ARCHIVED // 已歸檔
+}
+
+enum ElectionTarget {
+  ALL      // 全體會員
+  DISTRICT // 指定地區
+  TERM     // 指定期別
+}
+
+model Candidate {
+  id         Int      @id @default(autoincrement())
+  electionId Int
+  memberId   Int?     // 若為會員候選人
+  name       String   // 候選人姓名（也可自訂非會員候選人）
+  number     Int      @default(0) // 候選人號碼
+  photo      String?  // 候選人照片
+  bio        String?  @db.Text // 候選人簡介
+  createdAt  DateTime @default(now())
+
+  election Election @relation(fields: [electionId], references: [id], onDelete: Cascade)
+  member   Member?  @relation(fields: [memberId], references: [id])
+  votes    Vote[]
+
+  @@index([electionId])
+}
+
+model Vote {
+  id          Int      @id @default(autoincrement())
+  electionId  Int
+  candidateId Int
+  memberId    Int      // 投票的會員
+  createdAt   DateTime @default(now())
+
+  election  Election  @relation(fields: [electionId], references: [id], onDelete: Cascade)
+  candidate Candidate @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+  member    Member    @relation(fields: [memberId], references: [id])
+
+  @@unique([electionId, memberId, candidateId]) // 同一候選人不能重複投票
+  @@index([electionId])
+  @@index([memberId])
+}
+
+// ============================================
+// 審計日誌
+// ============================================
+
+model AuditLog {
+  id         Int       @id @default(autoincrement())
+  action     String    // 操作類型：CREATE, UPDATE, DELETE, LOGIN, LOGOUT, EXPORT 等
+  module     String    // 模組名稱：MEMBER, BILLING, EVENT, ORGANIZATION, POINTS, PUSH 等
+  targetId   Int?      // 被操作的對象 ID
+  targetName String?   // 被操作對象的名稱（方便查詢）
+  detail     String?   @db.Text // 操作詳情 JSON（變更前後值等）
+  adminId    Int?      // 操作的管理者 ID
+  adminName  String?   // 管理者名稱（快照）
+  memberId   Int?      // 操作的會員 ID（若為會員操作）
+  ip         String?   // 來源 IP
+  createdAt  DateTime  @default(now())
+
+  @@index([module])
+  @@index([action])
+  @@index([adminId])
+  @@index([createdAt])
+  @@index([targetId])
+}
