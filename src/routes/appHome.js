@@ -53,8 +53,9 @@ async function getSharedData() {
       where: { targetType: 'GENERAL', status: { in: visibleStatuses } },
       select: eventSelect,
       orderBy: { startTime: 'desc' },
+      take: 50,
     });
-  } catch { result.generalEvents = []; }
+  } catch (err) { console.error('[appHome] generalEvents 查詢失敗:', err.message); result.generalEvents = []; }
 
   // 地區活動（全部地區混合）
   try {
@@ -65,7 +66,7 @@ async function getSharedData() {
       take: 5,
     });
     result.districtEvents = applyMinRule(all);
-  } catch { result.districtEvents = []; }
+  } catch (err) { console.error('[appHome] districtEvents 查詢失敗:', err.message); result.districtEvents = []; }
 
   // 特別區活動
   try {
@@ -76,7 +77,7 @@ async function getSharedData() {
       take: 5,
     });
     result.specialEvents = applyMinRule(all);
-  } catch { result.specialEvents = []; }
+  } catch (err) { console.error('[appHome] specialEvents 查詢失敗:', err.message); result.specialEvents = []; }
 
   // 建青團活動
   try {
@@ -87,7 +88,7 @@ async function getSharedData() {
       take: 5,
     });
     result.cyEvents = applyMinRule(all);
-  } catch { result.cyEvents = []; }
+  } catch (err) { console.error('[appHome] cyEvents 查詢失敗:', err.message); result.cyEvents = []; }
 
   // AI 摘要通用版
   try {
@@ -96,7 +97,7 @@ async function getSharedData() {
       orderBy: { publishDate: 'desc' },
       take: 5,
     });
-  } catch { result.generalDigests = []; }
+  } catch (err) { console.error('[appHome] generalDigests 查詢失敗:', err.message); result.generalDigests = []; }
 
   sharedCache = result;
   sharedCacheTime = now;
@@ -146,7 +147,7 @@ router.get('/', verifyToken, async (req, res, next) => {
           ],
         },
       });
-    } catch { unreadCount = 0; }
+    } catch (err) { console.error('[appHome] unreadCount 查詢失敗:', err.message); unreadCount = 0; }
 
     // 2. 期別活動（依會員 termNumber）
     try {
@@ -161,7 +162,7 @@ router.get('/', verifyToken, async (req, res, next) => {
         take: 5,
       });
       termEvents = applyMinRule(all);
-    } catch { termEvents = []; }
+    } catch (err) { console.error('[appHome] termEvents 查詢失敗:', err.message); termEvents = []; }
 
     // 3. AI 摘要（依繳費狀態切換）
     try {
@@ -175,7 +176,7 @@ router.get('/', verifyToken, async (req, res, next) => {
         });
         if (custom.length > 0) digests = custom;
       }
-    } catch { /* 保持通用摘要 */ }
+    } catch (err) { console.error('[appHome] digests 查詢失敗:', err.message); /* 保持通用摘要 */ }
 
     // 4. 未繳費帳單數量（決定首頁浮動繳費鈕顯隱）
     let unpaidBillCount = 0;
@@ -183,7 +184,7 @@ router.get('/', verifyToken, async (req, res, next) => {
       unpaidBillCount = await prisma.bill.count({
         where: { memberId, status: 'UNPAID' },
       });
-    } catch { unpaidBillCount = 0; }
+    } catch (err) { console.error('[appHome] unpaidBillCount 查詢失敗:', err.message); unpaidBillCount = 0; }
 
     res.json({
       unreadCount,

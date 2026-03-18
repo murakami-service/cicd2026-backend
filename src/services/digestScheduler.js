@@ -103,7 +103,127 @@ function startDigestScheduler() {
     }
   });
 
-  console.log('[Scheduler] RSS 抓取 + 自動清理 + 點數到期提醒 + 活動狀態排程已啟動');
+  // ============================================
+  // 活動前一天提醒推播
+  // 每天上午 9:00 檢查：明天開始的活動，推播給已報名的會員
+  // ============================================
+  cron.schedule('0 9 * * *', async () => {
+    try {
+      const now = new Date();
+      const tomorrow = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1);
+      const dayAfter = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 2);
+
+      const tomorrowEvents = await prisma.event.findMany({
+        where: {
+          startTime: { gte: tomorrow, lt: dayAfter },
+          status: { in: ['OPEN', 'CLOSED'] },
+        },
+        include: {
+          _count: { select: { registrations: { where: { status: 'REGISTERED' } } } },
+        },
+      });
+
+      // DB creates sequential, push sends parallel
+      const preDayNotifications = [];
+      for (const event of tomorrowEvents) {
+        if (event._count.registrations === 0) continue;
+
+        const startHour = new Date(event.startTime).getHours();
+        const startMin = String(new Date(event.startTime).getMinutes()).padStart(2, '0');
+        const timeStr = `${startHour}:${startMin}`;
+
+        const notification = await prisma.pushNotification.create({
+          data: {
+            title: `明日活動提醒：${event.title}`,
+            body: `您報名的活動明天 ${timeStr} 開始${event.location ? `，地點：${event.location}` : ''}`,
+            targetType: 'EVENT',
+            targetId: event.id,
+            status: 'PENDING',
+          },
+        });
+        preDayNotifications.push({ notification, event });
+      }
+
+      // 並行發送所有推播
+      const preDayResults = await Promise.allSettled(
+        preDayNotifications.map(({ notification }) => sendPushNotification(notification))
+      );
+      preDayResults.forEach((result, i) => {
+        const { event } = preDayNotifications[i];
+        if (result.status === 'fulfilled') {
+          console.log(`[Scheduler] 活動提醒推播已發送: ${event.title} (${event._count.registrations} 人報名)`);
+        } else {
+          console.error(`[Scheduler] 活動提醒推播失敗: ${event.title}`, result.reason?.message);
+        }
+      });
+
+      if (tomorrowEvents.length > 0) {
+        console.log(`[Scheduler] 活動前一天提醒：${tomorrowEvents.length} 場活動`);
+      }
+    } catch (e) {
+      console.error('[Scheduler] 活動前一天提醒失敗:', e.message);
+    }
+  });
+
+  // ============================================
+  // 活動當天提醒推播
+  // 每天上午 7:00 檢查：今天開始的活動，推播給已報名的會員
+  // ============================================
+  cron.schedule('0 7 * * *', async () => {
+    try {
+      const now = new Date();
+      const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+      const tomorrow = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1);
+
+      const todayEvents = await prisma.event.findMany({
+        where: {
+          startTime: { gte: today, lt: tomorrow },
+          status: { in: ['OPEN', 'CLOSED', 'ONGOING'] },
+        },
+        include: {
+          _count: { select: { registrations: { where: { status: 'REGISTERED' } } } },
+        },
+      });
+
+      // DB creates sequential, push sends parallel
+      const sameDayNotifications = [];
+      for (const event of todayEvents) {
+        if (event._count.registrations === 0) continue;
+
+        const startHour = new Date(event.startTime).getHours();
+        const startMin = String(new Date(event.startTime).getMinutes()).padStart(2, '0');
+        const timeStr = `${startHour}:${startMin}`;
+
+        const notification = await prisma.pushNotification.create({
+          data: {
+            title: `今日活動：${event.title}`,
+            body: `活動今天 ${timeStr} 開始${event.location ? `，地點：${event.location}` : ''}，請準時出席！`,
+            targetType: 'EVENT',
+            targetId: event.id,
+            status: 'PENDING',
+          },
+        });
+        sameDayNotifications.push({ notification, event });
+      }
+
+      // 並行發送所有推播
+      const sameDayResults = await Promise.allSettled(
+        sameDayNotifications.map(({ notification }) => sendPushNotification(notification))
+      );
+      sameDayResults.forEach((result, i) => {
+        const { event } = sameDayNotifications[i];
+        if (result.status === 'fulfilled') {
+          console.log(`[Scheduler] 活動當天提醒推播已發送: ${event.title}`);
+        } else {
+          console.error(`[Scheduler] 活動當天提醒推播失敗: ${event.title}`, result.reason?.message);
+        }
+      });
+    } catch (e) {
+      console.error('[Scheduler] 活動當天提醒失敗:', e.message);
+    }
+  });
+
+  console.log('[Scheduler] RSS 抓取 + 自動清理 + 點數到期提醒 + 活動狀態 + 活動提醒排程已啟動');
 
   // 啟動時立即抓取一次 RSS（避免重啟後等到下個排程才更新）
   setTimeout(async () => {

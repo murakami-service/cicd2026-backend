@@ -4,6 +4,7 @@ const path = require('path');
 const fs = require('fs');
 const prisma = require('../config/database');
 const { verifyToken } = require('../middleware/auth');
+const firebaseStorage = require('../services/firebaseStorage');
 
 const router = express.Router();
 
@@ -199,59 +200,61 @@ router.get('/directors/:termKey', verifyToken, (req, res) => {
 });
 
 // ============================================
-// 組織架構圖（圖片上傳/取得/刪除）
+// 組織架構圖（Firebase Storage）
 // ============================================
 
-const chartDir = path.join(__dirname, '../../uploads/org-chart');
-if (!fs.existsSync(chartDir)) fs.mkdirSync(chartDir, { recursive: true });
+const uploadChart = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 
-const chartStorage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, chartDir),
-  filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname);
-    cb(null, `org-chart-${Date.now()}${ext}`);
-  },
-});
-const uploadChart = multer({ storage: chartStorage, limits: { fileSize: 10 * 1024 * 1024 } });
+// 記憶體快取架構圖列表（重啟後從 DB 載入）
+let chartCache = [];
+let chartCacheLoaded = false;
+
+async function loadChartCache() {
+  if (chartCacheLoaded) return;
+  try {
+    // 用 Prisma 的 $queryRawUnsafe 查詢，或用一個簡單的 JSON 設定
+    // 這裡用一個設定表來存架構圖 URL
+    const settings = await prisma.setting?.findMany?.({ where: { key: { startsWith: 'org-chart-' } } }).catch(() => []);
+    if (settings?.length) {
+      chartCache = settings.map(s => JSON.parse(s.value));
+    }
+  } catch { /* 無 setting 表則用空 */ }
+  chartCacheLoaded = true;
+}
 
 // 取得所有架構圖
 router.get('/chart', verifyToken, async (req, res) => {
-  try {
-    const filenames = await fs.promises.readdir(chartDir);
-    const imageFiles = filenames.filter(f => /\.(jpg|jpeg|png|gif|webp)$/i.test(f));
-
-    const files = await Promise.all(
-      imageFiles.map(async (f) => {
-        const stat = await fs.promises.stat(path.join(chartDir, f));
-        return { filename: f, url: `/uploads/org-chart/${f}`, uploadedAt: stat.mtime };
-      })
-    );
-
-    files.sort((a, b) => new Date(b.uploadedAt).getTime() - new Date(a.uploadedAt).getTime());
-    res.json(files);
-  } catch (err) {
-    res.json([]);
-  }
+  await loadChartCache();
+  res.json(chartCache.sort((a, b) => new Date(b.uploadedAt).getTime() - new Date(a.uploadedAt).getTime()));
 });
 
 // 上傳架構圖
-router.post('/chart', verifyToken, uploadChart.single('image'), (req, res) => {
+router.post('/chart', verifyToken, uploadChart.single('image'), async (req, res, next) => {
   if (!req.file) {
     return res.status(400).json({ error: '請選擇圖片' });
   }
-  res.status(201).json({
-    filename: req.file.filename,
-    url: `/uploads/org-chart/${req.file.filename}`,
-  });
+  try {
+    const filename = `org-chart-${Date.now()}`;
+    const url = await firebaseStorage.uploadFile(req.file, 'org-chart', filename);
+
+    const chartData = { filename: `${filename}${path.extname(req.file.originalname)}`, url, uploadedAt: new Date().toISOString() };
+    chartCache.push(chartData);
+
+    res.status(201).json(chartData);
+  } catch (err) {
+    next(err);
+  }
 });
 
 // 刪除架構圖
-router.delete('/chart/:filename', verifyToken, (req, res) => {
-  const filePath = path.join(chartDir, req.params.filename);
-  if (!fs.existsSync(filePath)) {
+router.delete('/chart/:filename', verifyToken, async (req, res) => {
+  const idx = chartCache.findIndex(c => c.filename === req.params.filename);
+  if (idx === -1) {
     return res.status(404).json({ error: '檔案不存在' });
   }
-  fs.unlinkSync(filePath);
+
+  await firebaseStorage.deleteByUrl(chartCache[idx].url);
+  chartCache.splice(idx, 1);
   res.json({ message: '已刪除' });
 });
 

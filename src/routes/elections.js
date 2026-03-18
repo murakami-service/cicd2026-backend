@@ -106,12 +106,13 @@ router.get('/:id', verifyToken, scopeByAdmin, async (req, res, next) => {
     }
 
     // 計算已投票人數（distinct memberId）
-    const voterCount = await prisma.vote.groupBy({
-      by: ['memberId'],
+    const voterCountResult = await prisma.vote.findMany({
       where: { electionId: election.id },
+      select: { memberId: true },
+      distinct: ['memberId'],
     });
 
-    res.json({ ...election, voterCount: voterCount.length });
+    res.json({ ...election, voterCount: voterCountResult.length });
   } catch (err) {
     next(err);
   }

@@ -165,6 +165,43 @@ router.post('/batches', verifyToken, scopeByAdmin, async (req, res, next) => {
   }
 });
 
+// 批次統計（全域，不受分頁影響）
+router.get('/batches/:batchId/stats', verifyToken, scopeByAdmin, async (req, res, next) => {
+  try {
+    const batchId = parseInt(req.params.batchId);
+    const [batch, statusCounts] = await Promise.all([
+      prisma.billingBatch.findUnique({
+        where: { id: batchId },
+        select: { id: true, title: true, amount: true, billingType: true, targetType: true, startDate: true, endDate: true, note: true, createdAt: true },
+      }),
+      prisma.bill.groupBy({
+        by: ['status'],
+        where: { batchId },
+        _count: true,
+      }),
+    ]);
+    if (!batch) return res.status(404).json({ error: '找不到此繳費批次' });
+
+    const counts = { UNPAID: 0, PAID: 0, MANUAL: 0, VOIDED: 0 };
+    statusCounts.forEach(s => { counts[s.status] = s._count; });
+    const total = counts.UNPAID + counts.PAID + counts.MANUAL + counts.VOIDED;
+    const paidTotal = counts.PAID + counts.MANUAL;
+
+    res.json({
+      ...batch,
+      stats: {
+        total,
+        paid: paidTotal,
+        unpaid: counts.UNPAID,
+        voided: counts.VOIDED,
+        paidRate: total > 0 ? Math.round((paidTotal / (total - counts.VOIDED)) * 100) : 0,
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // 批次內繳費明細
 router.get('/batches/:batchId/bills', verifyToken, scopeByAdmin, async (req, res, next) => {
   try {
@@ -250,6 +287,33 @@ router.put('/bills/:billId/void', verifyToken, scopeByAdmin, async (req, res, ne
     });
 
     res.json(bill);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// 刪除繳費批次（僅 SUPER 管理者）
+router.delete('/batches/:batchId', verifyToken, scopeByAdmin, async (req, res, next) => {
+  try {
+    if (!req.admin || req.admin.role !== 'SUPER') {
+      return res.status(403).json({ error: '僅總管理者可刪除繳費批次' });
+    }
+
+    const batchId = parseInt(req.params.batchId);
+
+    // 確認批次存在
+    const batch = await prisma.billingBatch.findUnique({ where: { id: batchId } });
+    if (!batch) {
+      return res.status(404).json({ error: '找不到該繳費批次' });
+    }
+
+    // 先刪除所有關聯帳單，再刪除批次（cascade）
+    await prisma.$transaction([
+      prisma.bill.deleteMany({ where: { batchId } }),
+      prisma.billingBatch.delete({ where: { id: batchId } }),
+    ]);
+
+    res.json({ message: `已刪除繳費批次「${batch.title}」及所有關聯帳單` });
   } catch (err) {
     next(err);
   }

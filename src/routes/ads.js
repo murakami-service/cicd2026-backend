@@ -1,24 +1,12 @@
 const express = require('express');
 const multer = require('multer');
-const path = require('path');
-const fs = require('fs');
 const prisma = require('../config/database');
 const { verifyToken, requireRole } = require('../middleware/auth');
+const firebaseStorage = require('../services/firebaseStorage');
 
 const router = express.Router();
 
-// 廣告圖片上傳目錄
-const adDir = path.join(__dirname, '../../uploads/ads');
-if (!fs.existsSync(adDir)) fs.mkdirSync(adDir, { recursive: true });
-
-const adStorage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, adDir),
-  filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname);
-    cb(null, `ad-${Date.now()}${ext}`);
-  },
-});
-const uploadAd = multer({ storage: adStorage, limits: { fileSize: 10 * 1024 * 1024 } });
+const uploadAd = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 
 // 取得目前有效廣告（前台/APP 用，不需驗證）
 router.get('/active', async (req, res, next) => {
@@ -55,9 +43,9 @@ router.get('/', async (req, res, next) => {
   }
 });
 
-// 上傳廣告圖片
+// 上傳廣告圖片（Firebase Storage）
 router.post('/upload', (req, res, next) => {
-  uploadAd.single('image')(req, res, (err) => {
+  uploadAd.single('image')(req, res, async (err) => {
     if (err) {
       if (err.code === 'LIMIT_FILE_SIZE') {
         return res.status(400).json({ error: '圖片大小不可超過 10MB' });
@@ -67,7 +55,12 @@ router.post('/upload', (req, res, next) => {
     if (!req.file) {
       return res.status(400).json({ error: '請選擇圖片' });
     }
-    res.json({ url: `/uploads/ads/${req.file.filename}` });
+    try {
+      const url = await firebaseStorage.uploadFile(req.file, 'ads', `ad-${Date.now()}`);
+      res.json({ url });
+    } catch (e) {
+      next(e);
+    }
   });
 });
 

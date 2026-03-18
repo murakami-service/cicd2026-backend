@@ -9,21 +9,20 @@ router.get('/', verifyToken, scopeByAdmin, async (req, res, next) => {
   try {
     const now = new Date();
 
-    // 1. 目前會員數
-    const totalMembers = await prisma.member.count({
-      where: { isActive: true },
-    });
-
-    // 2 & 3. 總會已繳費 / 未繳費會員數
-    // 找到目前有效的總會繳費批次
-    const generalBatch = await prisma.billingBatch.findFirst({
-      where: {
-        targetType: 'GENERAL',
-        status: 'ACTIVE',
-        endDate: { gte: now },
-      },
-      orderBy: { createdAt: 'desc' },
-    });
+    // 1. 目前會員數 + 2 & 3. 總會已繳費批次（並行查詢）
+    const [totalMembers, generalBatch] = await Promise.all([
+      prisma.member.count({
+        where: { isActive: true },
+      }),
+      prisma.billingBatch.findFirst({
+        where: {
+          targetType: 'GENERAL',
+          status: 'ACTIVE',
+          endDate: { gte: now },
+        },
+        orderBy: { createdAt: 'desc' },
+      }),
+    ]);
 
     let paidMembers = 0;
     let unpaidMembers = 0;
@@ -71,30 +70,29 @@ router.get('/', verifyToken, scopeByAdmin, async (req, res, next) => {
       lastMonthParticipation = (totalRate / lastMonthEvents.length).toFixed(1);
     }
 
-    // 5. 最近活動列表（最近 10 筆）
-    const recentEvents = await prisma.event.findMany({
-      where: {
-        status: { notIn: ['DRAFT', 'CANCELLED'] },
-      },
-      include: {
-        district: { select: { name: true } },
-        _count: { select: { registrations: { where: { status: 'REGISTERED' } }, checkins: true } },
-      },
-      orderBy: { startTime: 'desc' },
-      take: 10,
-    });
+    // 5. 最近活動列表 + 7. 繳費比例（並行查詢）
+    const [recentEvents, activeBatches] = await Promise.all([
+      prisma.event.findMany({
+        where: {
+          status: { notIn: ['DRAFT', 'CANCELLED'] },
+        },
+        include: {
+          district: { select: { name: true } },
+          _count: { select: { registrations: { where: { status: 'REGISTERED' } }, checkins: true } },
+        },
+        orderBy: { startTime: 'desc' },
+        take: 10,
+      }),
+      prisma.billingBatch.findMany({
+        where: { status: 'ACTIVE' },
+        include: {
+          district: { select: { name: true } },
+        },
+        orderBy: { createdAt: 'desc' },
+        take: 5,
+      }),
+    ]);
 
-    // 7. 繳費比例（所有進行中的批次）
-    const activeBatches = await prisma.billingBatch.findMany({
-      where: { status: 'ACTIVE' },
-      include: {
-        district: { select: { name: true } },
-      },
-      orderBy: { createdAt: 'desc' },
-      take: 5,
-    });
-
-    // 批次查詢所有 active batch 的繳費統計（避免 N+1）
     const activeBatchIds = activeBatches.map(b => b.id);
     const allActiveBillStats = activeBatchIds.length > 0
       ? await prisma.bill.groupBy({
@@ -127,30 +125,165 @@ router.get('/', verifyToken, scopeByAdmin, async (req, res, next) => {
       };
     });
 
-    // 8. 最近繳費名單（最新 10 筆）
-    const recentPayments = await prisma.bill.findMany({
-      where: {
-        status: { in: ['PAID', 'MANUAL'] },
-      },
-      include: {
-        member: { select: { account: true, name: true } },
-        batch: { select: { title: true } },
-      },
-      orderBy: { paymentDate: 'desc' },
-      take: 10,
-    });
+    // 8. 最近繳費 + A. 待辦提醒（並行查詢）
+    const weekLater = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
+
+    const [recentPayments, upcomingEvents, expiringBatches, activeElections, pendingPush] = await Promise.all([
+      // 8. 最近繳費名單（最新 10 筆）
+      prisma.bill.findMany({
+        where: {
+          status: { in: ['PAID', 'MANUAL'] },
+          paymentDate: { not: null },
+        },
+        include: {
+          member: { select: { account: true, name: true } },
+          batch: { select: { title: true } },
+        },
+        orderBy: { paymentDate: 'desc' },
+        take: 10,
+      }),
+      // A-1. 本週即將開始的活動
+      prisma.event.findMany({
+        where: {
+          status: { in: ['OPEN', 'CLOSED'] },
+          startTime: { gte: now, lte: weekLater },
+        },
+        select: { id: true, title: true, startTime: true, status: true },
+        orderBy: { startTime: 'asc' },
+        take: 5,
+      }),
+      // A-2. 即將截止的繳費批次（7 天內到期）
+      prisma.billingBatch.findMany({
+        where: {
+          status: 'ACTIVE',
+          endDate: { gte: now, lte: weekLater },
+        },
+        select: { id: true, title: true, endDate: true },
+        orderBy: { endDate: 'asc' },
+        take: 5,
+      }),
+      // A-3. 進行中的投票
+      prisma.election.findMany({
+        where: {
+          status: 'OPEN',
+          endTime: { gte: now },
+        },
+        select: { id: true, title: true, endTime: true },
+        orderBy: { endTime: 'asc' },
+        take: 5,
+      }),
+      // A-4. 待發送的排程推播
+      prisma.pushNotification.count({
+        where: { status: 'PENDING' },
+      }),
+    ]);
+
+    const todos = {
+      upcomingEvents: upcomingEvents.map(e => ({
+        id: e.id,
+        type: 'event',
+        title: e.title,
+        deadline: e.startTime,
+        label: '活動即將開始',
+      })),
+      expiringBatches: expiringBatches.map(b => ({
+        id: b.id,
+        type: 'billing',
+        title: b.title,
+        deadline: b.endDate,
+        label: '繳費即將截止',
+      })),
+      activeElections: activeElections.map(el => ({
+        id: el.id,
+        type: 'election',
+        title: el.title,
+        deadline: el.endTime,
+        label: '投票進行中',
+      })),
+      pendingPushCount: pendingPush,
+    };
+
+    // B. 推播統計（並行查詢）
+    const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+
+    const [pushStats, recentPushList] = await Promise.all([
+      prisma.pushNotification.groupBy({
+        by: ['status'],
+        where: { createdAt: { gte: thirtyDaysAgo } },
+        _count: true,
+      }),
+      prisma.pushNotification.findMany({
+        where: { createdAt: { gte: thirtyDaysAgo } },
+        select: { id: true, title: true, targetType: true, status: true, sentAt: true, createdAt: true },
+        orderBy: { createdAt: 'desc' },
+        take: 5,
+      }),
+    ]);
+
+    const pushSummary = {
+      total: pushStats.reduce((sum, s) => sum + s._count, 0),
+      sent: pushStats.filter(s => s.status === 'SENT').reduce((sum, s) => sum + s._count, 0),
+      pending: pushStats.filter(s => s.status === 'PENDING').reduce((sum, s) => sum + s._count, 0),
+      failed: pushStats.filter(s => s.status === 'FAILED').reduce((sum, s) => sum + s._count, 0),
+      recentList: recentPushList,
+    };
+
+    // C. 點數概況（並行查詢）
+    const [pointsIssued, pointsRedeemed, topProducts] = await Promise.all([
+      prisma.pointRecord.aggregate({
+        where: {
+          type: { in: ['CHECKIN', 'MANUAL'] },
+          expiresAt: { gt: now }, // 未過期的
+        },
+        _sum: { points: true },
+        _count: true,
+      }),
+      prisma.pointRedemption.aggregate({
+        _sum: { points: true },
+        _count: true,
+      }),
+      // 熱門兌換商品 TOP 3
+      prisma.pointRedemption.groupBy({
+        by: ['productId'],
+        _count: { productId: true },
+        _sum: { points: true },
+        orderBy: { _count: { productId: 'desc' } },
+        take: 3,
+      }),
+    ]);
+
+    let topProductDetails = [];
+    if (topProducts.length > 0) {
+      const productIds = topProducts.map(p => p.productId);
+      const products = await prisma.redeemProduct.findMany({
+        where: { id: { in: productIds } },
+        select: { id: true, name: true, points: true },
+      });
+      const productMap = new Map(products.map(p => [p.id, p]));
+
+      topProductDetails = topProducts.map(tp => ({
+        productId: tp.productId,
+        name: productMap.get(tp.productId)?.name || '未知商品',
+        costPoints: productMap.get(tp.productId)?.points || 0,
+        redeemCount: typeof tp._count === 'object' ? tp._count.productId : tp._count,
+        totalPoints: tp._sum.points || 0,
+      }));
+    }
+
+    const pointsSummary = {
+      totalIssued: pointsIssued._sum.points || 0,
+      issuedCount: pointsIssued._count,
+      totalRedeemed: pointsRedeemed._sum.points || 0,
+      redeemedCount: pointsRedeemed._count,
+      topProducts: topProductDetails,
+    };
 
     res.json({
-      // 1. 會員總數
       totalMembers,
-      // 2. 總會已繳費
       paidMembers,
-      // 3. 未繳費
       unpaidMembers,
-      // 4. 上月活動參與度
       lastMonthParticipation: `${lastMonthParticipation}%`,
       lastMonthEventCount: lastMonthEvents.length,
-      // 5. 最近活動
       recentEvents: recentEvents.map((e) => ({
         id: e.id,
         title: e.title,
@@ -161,19 +294,21 @@ router.get('/', verifyToken, scopeByAdmin, async (req, res, next) => {
         registrations: e._count.registrations,
         checkins: e._count.checkins,
       })),
-      // 7. 繳費比例
       paymentRate: `${paymentRate}%`,
       batchStats,
-      // 8. 最近繳費名單
       recentPayments: recentPayments.map((p) => ({
-        memberAccount: p.member.account,
-        memberName: p.member.name,
-        batchTitle: p.batch.title,
+        memberAccount: p.member?.account || '未知',
+        memberName: p.member?.name || '未知',
+        batchTitle: p.batch?.title || '未知',
         amount: p.amount,
         paymentMethod: p.paymentMethod,
         paymentDate: p.paymentDate,
         status: p.status,
       })),
+      // 新增
+      todos,
+      pushSummary,
+      pointsSummary,
     });
   } catch (err) {
     next(err);

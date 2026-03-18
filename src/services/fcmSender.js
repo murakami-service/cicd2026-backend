@@ -116,11 +116,15 @@ async function sendPushNotification(notification) {
       { notificationId: notification.id }
     );
 
-    // 清理失效的 tokens
+    // 清理失效的 tokens（分批刪除，每批 1000）
     if (result.failedTokens.length > 0) {
-      await prisma.pushToken.deleteMany({
-        where: { token: { in: result.failedTokens } },
-      });
+      const CHUNK_SIZE = 1000;
+      for (let i = 0; i < result.failedTokens.length; i += CHUNK_SIZE) {
+        const chunk = result.failedTokens.slice(i, i + CHUNK_SIZE);
+        await prisma.pushToken.deleteMany({
+          where: { token: { in: chunk } },
+        });
+      }
       console.log(`[FCM] 清理 ${result.failedTokens.length} 個失效 token`);
     }
 

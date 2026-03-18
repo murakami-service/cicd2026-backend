@@ -15,6 +15,7 @@ function initFirebase() {
     const serviceAccount = require(require('path').resolve(keyPath));
     admin.initializeApp({
       credential: admin.credential.cert(serviceAccount),
+      storageBucket: process.env.FIREBASE_STORAGE_BUCKET || 'cicd2026-907dc.firebasestorage.app',
     });
     initialized = true;
     console.log('[Firebase] Admin SDK 初始化成功');

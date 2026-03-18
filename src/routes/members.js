@@ -1,27 +1,17 @@
 const express = require('express');
-const bcrypt = require('bcrypt');
+const bcrypt = require('bcryptjs');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 const prisma = require('../config/database');
 const { verifyToken, scopeByAdmin } = require('../middleware/auth');
+const firebaseStorage = require('../services/firebaseStorage');
 
 const router = express.Router();
 
-// 大頭照上傳設定
-const avatarStorage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    const dir = path.join(__dirname, '../../uploads/avatars');
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    cb(null, dir);
-  },
-  filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname) || '.jpg';
-    cb(null, `member-${req.params.id}-${Date.now()}${ext}`);
-  },
-});
+// 大頭照上傳設定（memoryStorage → Firebase Storage）
 const avatarUpload = multer({
-  storage: avatarStorage,
+  storage: multer.memoryStorage(),
   limits: { fileSize: 5 * 1024 * 1024 }, // 5MB
   fileFilter: (req, file, cb) => {
     const allowed = ['.jpg', '.jpeg', '.png', '.webp'];
@@ -172,22 +162,24 @@ router.put('/app/profile', verifyToken, async (req, res, next) => {
   }
 });
 
-// APP — 上傳大頭照
+// APP — 上傳大頭照（Firebase Storage）
 router.post('/app/avatar', verifyToken, (req, res, next) => {
   if (!req.member) {
     return res.status(401).json({ error: '請使用會員身分登入' });
   }
-  req.params.id = String(req.member.id);
   avatarUpload.single('avatar')(req, res, async (err) => {
     if (err) return res.status(400).json({ error: err.message || '上傳失敗' });
     if (!req.file) return res.status(400).json({ error: '請選擇圖片' });
     try {
+      // 刪除舊頭像
       const old = await prisma.member.findUnique({ where: { id: req.member.id }, select: { avatar: true } });
-      if (old?.avatar) {
-        const oldPath = path.join(__dirname, '../../', old.avatar);
-        if (fs.existsSync(oldPath)) fs.unlinkSync(oldPath);
-      }
-      const avatarUrl = `/uploads/avatars/${req.file.filename}`;
+      if (old?.avatar) await firebaseStorage.deleteByUrl(old.avatar);
+
+      const avatarUrl = await firebaseStorage.uploadFile(
+        req.file,
+        'avatars',
+        `member-${req.member.id}-${Date.now()}`
+      );
       await prisma.member.update({ where: { id: req.member.id }, data: { avatar: avatarUrl } });
       res.json({ avatar: avatarUrl });
     } catch (e) { next(e); }
@@ -331,66 +323,188 @@ router.post('/import', verifyToken, scopeByAdmin, async (req, res, next) => {
       '經營品牌': 'brand',
     };
 
-    let created = 0;
-    let skipped = 0;
-    const errors = [];
-
-    for (const raw of members) {
+    // Step 1: 映射所有欄位
+    const rows = members.map(raw => {
       const row = {};
       for (const [key, value] of Object.entries(raw)) {
         const mappedKey = fieldMap[key.trim()] || key.trim();
         row[mappedKey] = typeof value === 'string' ? value.trim() : value;
       }
+      return row;
+    });
 
+    // Step 2: 篩選有效資料（有帳號+姓名）
+    const errors = [];
+    const validRows = [];
+    for (const row of rows) {
       if (!row.account || !row.name) {
-        skipped++;
         errors.push({ account: row.account, reason: '缺少帳號或姓名' });
-        continue;
+      } else {
+        validRows.push(row);
       }
-
-      const existing = await prisma.member.findUnique({ where: { account: row.account } });
-      if (existing) {
-        skipped++;
-        errors.push({ account: row.account, reason: '帳號已存在' });
-        continue;
-      }
-
-      const { termNumber, studentNumber, memberType } = parseAccount(row.account);
-      const birthdayDate = rocBirthdayToDate(row.birthday);
-      const defaultPassword = rocBirthdayToPassword(row.birthday);
-      const hashedPassword = await bcrypt.hash(defaultPassword, 10);
-      const districtId = await resolveDistrictId(row.district);
-
-      await prisma.member.create({
-        data: {
-          account: row.account,
-          password: hashedPassword,
-          name: row.name,
-          gender: row.gender || null,
-          email: row.email || null,
-          phone: row.phone || null,
-          birthday: birthdayDate,
-          company: row.company || null,
-          jobTitle: row.jobTitle || null,
-          industry: row.industry || null,
-          businessItems: row.businessItems || null,
-          brand: row.brand || null,
-          website: row.website || null,
-          companyPhone: row.companyPhone || null,
-          fax: row.fax || null,
-          address: row.address || null,
-          memberType,
-          termNumber,
-          studentNumber,
-          districtId,
-        },
-      });
-      created++;
     }
 
+    // Step 3: 批次查重（一次查完，含完整欄位用於比對差異）
+    const allAccounts = validRows.map(r => r.account);
+    const existingMembers = await prisma.member.findMany({
+      where: { account: { in: allAccounts } },
+      select: {
+        id: true, account: true, name: true, gender: true, email: true,
+        phone: true, birthday: true, company: true, jobTitle: true,
+        industry: true, businessItems: true, brand: true, website: true,
+        companyPhone: true, fax: true, address: true, districtId: true,
+      },
+    });
+    const existingMap = new Map(existingMembers.map(m => [m.account, m]));
+
+    const newRows = [];
+    const updateRows = [];
+    for (const row of validRows) {
+      if (existingMap.has(row.account)) {
+        updateRows.push(row);
+      } else {
+        newRows.push(row);
+      }
+    }
+
+    // Step 4: 批次解析 district（快取避免重複查詢）
+    const districtCache = new Map();
+    async function resolveDistrictCached(name) {
+      if (!name) return null;
+      if (districtCache.has(name)) return districtCache.get(name);
+      const id = await resolveDistrictId(name);
+      districtCache.set(name, id);
+      return id;
+    }
+
+    // 比對欄位用的 key 列表（不含 password、account）
+    const COMPARE_FIELDS = [
+      'name', 'gender', 'email', 'phone', 'company', 'jobTitle',
+      'industry', 'businessItems', 'brand', 'website', 'companyPhone',
+      'fax', 'address',
+    ];
+
+    // Step 5: 更新已存在的會員（比對差異，有差異才 update）
+    const BATCH_SIZE = 200;
+    let created = 0;
+    let updated = 0;
+    let unchanged = 0;
+
+    for (let i = 0; i < updateRows.length; i += BATCH_SIZE) {
+      const batch = updateRows.slice(i, i + BATCH_SIZE);
+
+      await Promise.all(
+        batch.map(async (row) => {
+          const existing = existingMap.get(row.account);
+          const districtId = await resolveDistrictCached(row.district);
+          const birthdayDate = rocBirthdayToDate(row.birthday);
+
+          // 組裝 CSV 資料
+          const csvData = {
+            name: row.name || null,
+            gender: row.gender || null,
+            email: row.email || null,
+            phone: row.phone || null,
+            company: row.company || null,
+            jobTitle: row.jobTitle || null,
+            industry: row.industry || null,
+            businessItems: row.businessItems || null,
+            brand: row.brand || null,
+            website: row.website || null,
+            companyPhone: row.companyPhone || null,
+            fax: row.fax || null,
+            address: row.address || null,
+          };
+
+          // 比對差異
+          const diff = {};
+          for (const field of COMPARE_FIELDS) {
+            const csvVal = csvData[field] || null;
+            const dbVal = existing[field] || null;
+            if (csvVal !== dbVal && csvVal !== null) {
+              diff[field] = csvVal;
+            }
+          }
+
+          // 比對 districtId
+          if (districtId !== null && districtId !== existing.districtId) {
+            diff.districtId = districtId;
+          }
+
+          // 比對 birthday
+          if (birthdayDate) {
+            const existingBday = existing.birthday ? new Date(existing.birthday).toISOString().slice(0, 10) : null;
+            const csvBday = birthdayDate.toISOString().slice(0, 10);
+            if (csvBday !== existingBday) {
+              diff.birthday = birthdayDate;
+            }
+          }
+
+          if (Object.keys(diff).length > 0) {
+            await prisma.member.update({
+              where: { id: existing.id },
+              data: diff,
+            });
+            updated++;
+          } else {
+            unchanged++;
+          }
+        })
+      );
+    }
+
+    // Step 6: 新增不存在的會員（並行 hash + createMany）
+    for (let i = 0; i < newRows.length; i += BATCH_SIZE) {
+      const batch = newRows.slice(i, i + BATCH_SIZE);
+
+      const prepared = await Promise.all(
+        batch.map(async (row) => {
+          const { termNumber, studentNumber, memberType } = parseAccount(row.account);
+          const birthdayDate = rocBirthdayToDate(row.birthday);
+          const defaultPassword = rocBirthdayToPassword(row.birthday);
+          const [hashedPassword, districtId] = await Promise.all([
+            bcrypt.hash(defaultPassword, 8),
+            resolveDistrictCached(row.district),
+          ]);
+
+          return {
+            account: row.account,
+            password: hashedPassword,
+            name: row.name,
+            gender: row.gender || null,
+            email: row.email || null,
+            phone: row.phone || null,
+            birthday: birthdayDate,
+            company: row.company || null,
+            jobTitle: row.jobTitle || null,
+            industry: row.industry || null,
+            businessItems: row.businessItems || null,
+            brand: row.brand || null,
+            website: row.website || null,
+            companyPhone: row.companyPhone || null,
+            fax: row.fax || null,
+            address: row.address || null,
+            memberType,
+            termNumber,
+            studentNumber,
+            districtId,
+          };
+        })
+      );
+
+      const result = await prisma.member.createMany({
+        data: prepared,
+        skipDuplicates: true,
+      });
+      created += result.count;
+    }
+
+    const skipped = errors.length;
     res.status(201).json({
-      message: `匯入完成：成功 ${created} 筆，略過 ${skipped} 筆`,
+      message: `匯入完成：新增 ${created} 筆，更新 ${updated} 筆，無異動 ${unchanged} 筆，略過 ${skipped} 筆`,
       created,
+      updated,
+      unchanged,
       skipped,
       errors: errors.slice(0, 50),
     });
@@ -594,6 +708,21 @@ router.get('/', verifyToken, scopeByAdmin, async (req, res, next) => {
     if (industry) where.industry = { contains: industry };
     if (memberType) where.memberType = memberType;
 
+    // 查詢當年度總會年費批次 ID
+    const currentYear = new Date().getFullYear();
+    const yearStart = new Date(currentYear, 0, 1);
+    const yearEnd = new Date(currentYear + 1, 0, 1);
+
+    const annualBatches = await prisma.billingBatch.findMany({
+      where: {
+        billingType: 'ANNUAL',
+        targetType: 'GENERAL',
+        startDate: { gte: yearStart, lt: yearEnd },
+      },
+      select: { id: true },
+    });
+    const annualBatchIds = annualBatches.map(b => b.id);
+
     const [members, total] = await Promise.all([
       prisma.member.findMany({
         where,
@@ -605,17 +734,28 @@ router.get('/', verifyToken, scopeByAdmin, async (req, res, next) => {
             where: { expiresAt: { gt: new Date() } },
             select: { points: true },
           },
+          bills: annualBatchIds.length > 0 ? {
+            where: { batchId: { in: annualBatchIds } },
+            select: { status: true },
+          } : false,
         },
         orderBy: { account: 'asc' },
       }),
       prisma.member.count({ where }),
     ]);
 
-    // 計算每位會員的點數餘額（只算未過期，REDEEM 已存負值）
+    // 計算每位會員的點數餘額 + 繳費狀態
     const data = members.map((m) => {
       const balance = (m.points || []).reduce((sum, r) => sum + r.points, 0);
-      const { points: _pts, ...rest } = m;
-      return { ...rest, pointBalance: balance };
+      const bills = m.bills || [];
+      // 繳費狀態：有帳單且全部 PAID/MANUAL → 已完成，有帳單但有未繳 → 尚未繳費，無帳單 → null
+      let billingStatus = null;
+      if (bills.length > 0) {
+        const allPaid = bills.every(b => b.status === 'PAID' || b.status === 'MANUAL');
+        billingStatus = allPaid ? 'PAID' : 'UNPAID';
+      }
+      const { points: _pts, bills: _bills, ...rest } = m;
+      return { ...rest, pointBalance: balance, billingStatus };
     });
 
     res.json({
@@ -678,21 +818,22 @@ router.patch('/batch-assign', verifyToken, scopeByAdmin, async (req, res, next) 
       });
     }
 
-    // 批次設定特別區（多對多）
+    // 批次設定特別區（多對多）— 單次批量操作避免 N+1
     if (Array.isArray(specialDistrictIds)) {
-      for (const memberId of memberIds) {
-        const mid = Number(memberId);
-        // 先清除該會員現有特別區
-        await prisma.memberSpecialDistrict.deleteMany({ where: { memberId: mid } });
-        // 再寫入新的
-        if (specialDistrictIds.length > 0) {
-          await prisma.memberSpecialDistrict.createMany({
-            data: specialDistrictIds.map((did) => ({
-              memberId: mid,
-              districtId: Number(did),
-            })),
-          });
+      const numericMemberIds = memberIds.map(Number);
+      // 一次刪除所有選定會員的現有特別區
+      await prisma.memberSpecialDistrict.deleteMany({
+        where: { memberId: { in: numericMemberIds } },
+      });
+      // 一次寫入所有會員 × 特別區組合
+      if (specialDistrictIds.length > 0) {
+        const createData = [];
+        for (const mid of numericMemberIds) {
+          for (const did of specialDistrictIds) {
+            createData.push({ memberId: mid, districtId: Number(did) });
+          }
         }
+        await prisma.memberSpecialDistrict.createMany({ data: createData });
       }
     }
 
@@ -784,7 +925,7 @@ router.post('/:id/reset-password', verifyToken, scopeByAdmin, async (req, res, n
 });
 
 // 修改會員（後台）
-// 上傳大頭照
+// 上傳大頭照（Firebase Storage）
 router.post('/:id/avatar', verifyToken, scopeByAdmin, (req, res, next) => {
   avatarUpload.single('avatar')(req, res, async (err) => {
     if (err) {
@@ -795,13 +936,15 @@ router.post('/:id/avatar', verifyToken, scopeByAdmin, (req, res, next) => {
     }
     try {
       const memberId = parseInt(req.params.id);
-      // 刪除舊大頭照
+      // 刪除舊頭像
       const old = await prisma.member.findUnique({ where: { id: memberId }, select: { avatar: true } });
-      if (old?.avatar) {
-        const oldPath = path.join(__dirname, '../../', old.avatar);
-        if (fs.existsSync(oldPath)) fs.unlinkSync(oldPath);
-      }
-      const avatarUrl = `/uploads/avatars/${req.file.filename}`;
+      if (old?.avatar) await firebaseStorage.deleteByUrl(old.avatar);
+
+      const avatarUrl = await firebaseStorage.uploadFile(
+        req.file,
+        'avatars',
+        `member-${memberId}-${Date.now()}`
+      );
       await prisma.member.update({
         where: { id: memberId },
         data: { avatar: avatarUrl },
@@ -848,6 +991,42 @@ router.put('/:id', verifyToken, scopeByAdmin, async (req, res, next) => {
     });
 
     res.json(member);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// 刪除會員（僅總管理者，軟刪除改為硬刪除 + 關聯資料清理）
+router.delete('/:id', verifyToken, scopeByAdmin, async (req, res, next) => {
+  try {
+    if (!req.admin || req.admin.role !== 'SUPER') {
+      return res.status(403).json({ error: '僅總管理者可刪除會員' });
+    }
+
+    const id = parseInt(req.params.id);
+    const member = await prisma.member.findUnique({ where: { id } });
+    if (!member) {
+      return res.status(404).json({ error: '找不到此會員' });
+    }
+
+    // 刪除所有關聯資料後刪除會員（transaction 確保一致性）
+    await prisma.$transaction([
+      prisma.memberSpecialDistrict.deleteMany({ where: { memberId: id } }),
+      prisma.organizationRole.deleteMany({ where: { memberId: id } }),
+      prisma.pointRecord.deleteMany({ where: { memberId: id } }),
+      prisma.vote.deleteMany({ where: { memberId: id } }),
+      prisma.bill.deleteMany({ where: { memberId: id } }),
+      prisma.eventRegistration.deleteMany({ where: { memberId: id } }),
+      prisma.pushToken.deleteMany({ where: { memberId: id } }),
+      prisma.digestPreference.deleteMany({ where: { memberId: id } }),
+      prisma.digest.deleteMany({ where: { memberId: id } }),
+      prisma.checkin.deleteMany({ where: { memberId: id } }),
+      prisma.photoTag.deleteMany({ where: { memberId: id } }),
+      prisma.photo.deleteMany({ where: { memberId: id } }),
+      prisma.member.delete({ where: { id } }),
+    ]);
+
+    res.json({ message: `已刪除會員 ${member.name}（${member.account}）` });
   } catch (err) {
     next(err);
   }

@@ -4,7 +4,8 @@
   "description": "工商建研會會員管理系統 — 後台 API",
   "main": "src/app.js",
   "scripts": {
-	"start": "node src/app.js"
+    "build": "npx prisma generate",
+    "start": "npx prisma migrate deploy && node src/app.js",
     "dev": "nodemon src/app.js",
     "db:migrate": "npx prisma migrate dev",
     "db:seed": "npx prisma db seed",
@@ -17,8 +18,9 @@
   "type": "commonjs",
   "dependencies": {
     "@anthropic-ai/sdk": "^0.78.0",
-    "@prisma/client": "^5.22.0",
-    "bcrypt": "^6.0.0",
+    "@prisma/client": "^6.19.2",
+    "bcryptjs": "^2.4.3",
+    "cloudinary": "^2.9.0",
     "cors": "^2.8.6",
     "dotenv": "^17.3.1",
     "express": "^5.2.1",
@@ -28,11 +30,11 @@
     "jsonwebtoken": "^9.0.3",
     "multer": "^2.1.1",
     "node-cron": "^4.2.1",
+    "prisma": "^6.19.2",
     "rss-parser": "^3.13.0",
     "uuid": "^13.0.0"
   },
   "devDependencies": {
-    "nodemon": "^3.1.14",
-    "prisma": "^5.22.0"
+    "nodemon": "^3.1.14"
   }
 }

@@ -1,8 +1,8 @@
 const express = require('express');
 const multer = require('multer');
-const path = require('path');
 const prisma = require('../config/database');
 const { verifyToken, requireRole } = require('../middleware/auth');
+const firebaseStorage = require('../services/firebaseStorage');
 
 const router = express.Router();
 
@@ -239,15 +239,8 @@ router.delete('/:id', async (req, res, next) => {
   }
 });
 
-// 商品圖片上傳
-const productStorage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, path.join(__dirname, '../../uploads/products')),
-  filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname);
-    cb(null, `product-${req.params.id}-${Date.now()}${ext}`);
-  },
-});
-const uploadProductImage = multer({ storage: productStorage, limits: { fileSize: 2 * 1024 * 1024 } });
+// 商品圖片上傳（Firebase Storage）
+const uploadProductImage = multer({ storage: multer.memoryStorage(), limits: { fileSize: 2 * 1024 * 1024 } });
 
 router.post('/:id/image', uploadProductImage.single('image'), async (req, res, next) => {
   try {
@@ -255,7 +248,15 @@ router.post('/:id/image', uploadProductImage.single('image'), async (req, res, n
       return res.status(400).json({ error: '請選擇圖片' });
     }
 
-    const imageUrl = `/uploads/products/${req.file.filename}`;
+    // 刪除舊圖
+    const old = await prisma.redeemProduct.findUnique({ where: { id: parseInt(req.params.id) }, select: { imageUrl: true } });
+    if (old?.imageUrl) await firebaseStorage.deleteByUrl(old.imageUrl);
+
+    const imageUrl = await firebaseStorage.uploadFile(
+      req.file,
+      'products',
+      `product-${req.params.id}-${Date.now()}`
+    );
     const product = await prisma.redeemProduct.update({
       where: { id: parseInt(req.params.id) },
       data: { imageUrl },

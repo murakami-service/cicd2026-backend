@@ -82,7 +82,7 @@ function generateToken(admin) {
       memberType: admin.memberType,
     },
     JWT_SECRET,
-    { expiresIn: '8h' }
+    { expiresIn: '12h' }
   );
 }
 

@@ -4,6 +4,7 @@ const path = require('path');
 const fs = require('fs');
 const prisma = require('../config/database');
 const { verifyToken } = require('../middleware/auth');
+const firebaseStorage = require('../services/firebaseStorage');
 
 const router = express.Router();
 
@@ -20,19 +21,8 @@ router.use((req, res, next) => {
 // 大頭照上傳設定
 // ============================================
 
-const avatarStorage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    const dir = path.join(__dirname, '../../uploads/avatars');
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    cb(null, dir);
-  },
-  filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname) || '.jpg';
-    cb(null, `member-${req.member.id}-${Date.now()}${ext}`);
-  },
-});
 const avatarUpload = multer({
-  storage: avatarStorage,
+  storage: multer.memoryStorage(),
   limits: { fileSize: 2 * 1024 * 1024 }, // 2MB
   fileFilter: (req, file, cb) => {
     const allowed = ['.jpg', '.jpeg', '.png', '.webp'];
@@ -125,13 +115,21 @@ router.post('/avatar', avatarUpload.single('avatar'), async (req, res, next) => 
       return res.status(400).json({ error: '請上傳圖片檔案' });
     }
 
-    const avatarPath = `/uploads/avatars/${req.file.filename}`;
+    // 刪除舊頭像
+    const old = await prisma.member.findUnique({ where: { id: req.member.id }, select: { avatar: true } });
+    if (old?.avatar) await firebaseStorage.deleteByUrl(old.avatar);
+
+    const avatarUrl = await firebaseStorage.uploadFile(
+      req.file,
+      'avatars',
+      `member-${req.member.id}-${Date.now()}`
+    );
     await prisma.member.update({
       where: { id: req.member.id },
-      data: { avatar: avatarPath },
+      data: { avatar: avatarUrl },
     });
 
-    res.json({ avatar: avatarPath });
+    res.json({ avatar: avatarUrl });
   } catch (err) {
     next(err);
   }
@@ -145,7 +143,7 @@ const visibleStatuses = ['OPEN', 'CLOSED', 'ONGOING', 'ENDED'];
 
 router.get('/events', async (req, res, next) => {
   try {
-    const { page = 1, limit = 20, status, keyword } = req.query;
+    const { page = 1, limit = 20, status, keyword, targetType } = req.query;
     const skip = (parseInt(page) - 1) * parseInt(limit);
     const memberId = req.member.id;
 
@@ -198,9 +196,19 @@ router.get('/events', async (req, res, next) => {
       OR: targetConditions,
     };
 
-    // 活動篩選：依狀態
-    if (status && visibleStatuses.includes(status)) {
-      where.status = status;
+    // 活動篩選：依 targetType（APP 端篩選器）
+    if (targetType && targetType.trim()) {
+      where.targetType = targetType.trim();
+    }
+
+    // 活動篩選：依狀態（支援逗號分隔多狀態：OPEN,ONGOING,CLOSED）
+    if (status) {
+      const statusArr = status.split(',').map(s => s.trim()).filter(s => visibleStatuses.includes(s));
+      if (statusArr.length === 1) {
+        where.status = statusArr[0];
+      } else if (statusArr.length > 1) {
+        where.status = { in: statusArr };
+      }
     }
 
     // 活動篩選：依關鍵字（標題或地點）
@@ -587,32 +595,18 @@ router.get('/points', async (req, res, next) => {
     const skip = (parseInt(page) - 1) * parseInt(limit);
     const memberId = req.member.id;
 
-    // 計算有效點數餘額（未過期的）
-    const balanceResult = await prisma.pointRecord.aggregate({
-      where: {
-        memberId,
-        expiresAt: { gt: new Date() },
-      },
-      _sum: { points: true },
-    });
-    const balance = balanceResult._sum.points || 0;
-
-    // 最近到期日（取最早的未過期正值紀錄的 expiresAt）
-    const nearestExpiry = await prisma.pointRecord.findFirst({
-      where: {
-        memberId,
-        points: { gt: 0 },
-        expiresAt: { gt: new Date() },
-      },
-      orderBy: { expiresAt: 'asc' },
-      select: { expiresAt: true },
-    });
-    const expiryDate = nearestExpiry?.expiresAt || null;
-
-    // 最近點數紀錄
+    const now = new Date();
     const where = { memberId };
 
-    const [records, total] = await Promise.all([
+    // 並行查詢：點數餘額 + 紀錄列表 + 總數
+    const [balanceResult, records, total] = await Promise.all([
+      prisma.pointRecord.aggregate({
+        where: {
+          memberId,
+          expiresAt: { gt: now },
+        },
+        _sum: { points: true },
+      }),
       prisma.pointRecord.findMany({
         where,
         skip,
@@ -624,6 +618,21 @@ router.get('/points', async (req, res, next) => {
       }),
       prisma.pointRecord.count({ where }),
     ]);
+
+    const balance = balanceResult._sum.points || 0;
+
+    // 從已查詢的紀錄中找最近到期日（避免額外查詢）
+    // 需要另查未過期正值紀錄的最早 expiresAt（因分頁紀錄不一定包含）
+    const nearestExpiry = await prisma.pointRecord.findFirst({
+      where: {
+        memberId,
+        points: { gt: 0 },
+        expiresAt: { gt: now },
+      },
+      orderBy: { expiresAt: 'asc' },
+      select: { expiresAt: true },
+    });
+    const expiryDate = nearestExpiry?.expiresAt || null;
 
     res.json({
       balance,
@@ -854,10 +863,13 @@ router.get('/stores', async (req, res, next) => {
     const stores = await prisma.store.findMany({
       where,
       include: {
-        offers: true,
-        member: { select: { name: true, company: true } },
+        offers: {
+          where: { isActive: true },
+          orderBy: { sortOrder: 'asc' },
+        },
+        member: { select: { name: true, company: true, account: true } },
       },
-      orderBy: { createdAt: 'desc' },
+      orderBy: [{ sortOrder: 'asc' }, { createdAt: 'desc' }],
     });
 
     res.json({ data: stores });
@@ -1405,7 +1417,7 @@ router.get('/:id', async (req, res, next) => {
 // ============================================
 // 密碼修改
 // ============================================
-const bcrypt = require('bcrypt');
+const bcrypt = require('bcryptjs');
 
 router.put('/password', async (req, res, next) => {
   try {
@@ -1524,19 +1536,8 @@ router.delete('/follow/:id', async (req, res, next) => {
 // 照片上傳 / 列表
 // ============================================
 
-const photoStorage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    const dir = path.join(__dirname, '../../uploads/photos');
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    cb(null, dir);
-  },
-  filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname) || '.jpg';
-    cb(null, `photo-${req.member.id}-${Date.now()}${ext}`);
-  },
-});
 const photoUpload = multer({
-  storage: photoStorage,
+  storage: multer.memoryStorage(),
   limits: { fileSize: 5 * 1024 * 1024 }, // 5MB
   fileFilter: (req, file, cb) => {
     const allowed = ['.jpg', '.jpeg', '.png', '.webp'];
@@ -1555,7 +1556,11 @@ router.post('/photo/upload', photoUpload.single('upload_file'), async (req, res,
     }
 
     const { title, user_ids } = req.body;
-    const imageUrl = `/uploads/photos/${req.file.filename}`;
+    const imageUrl = await firebaseStorage.uploadFile(
+      req.file,
+      'photos',
+      `photo-${req.member.id}-${Date.now()}`
+    );
 
     // 建立照片記錄
     const photo = await prisma.photo.create({
@@ -1590,6 +1595,7 @@ router.post('/photo/upload', photoUpload.single('upload_file'), async (req, res,
 // GET /app/member/photos - 我上傳的照片
 router.get('/photos', async (req, res, next) => {
   try {
+    const take = parseInt(req.query.limit) || 100;
     const photos = await prisma.photo.findMany({
       where: { memberId: req.member.id },
       include: {
@@ -1598,6 +1604,7 @@ router.get('/photos', async (req, res, next) => {
         },
       },
       orderBy: { createdAt: 'desc' },
+      take,
     });
     res.json({ data: photos });
   } catch (err) {
@@ -1677,6 +1684,37 @@ router.put('/photo/:id/tags', async (req, res, next) => {
     });
 
     res.json({ message: '已更新標籤', photo: updated });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// DELETE /app/member/photo/:id - 刪除照片（僅本人上傳的）
+router.delete('/photo/:id', async (req, res, next) => {
+  try {
+    const photoId = parseInt(req.params.id);
+
+    const photo = await prisma.photo.findUnique({ where: { id: photoId } });
+    if (!photo) {
+      return res.status(404).json({ error: '照片不存在' });
+    }
+    if (photo.memberId !== req.member.id) {
+      return res.status(403).json({ error: '只能刪除自己上傳的照片' });
+    }
+
+    // 嘗試從 Firebase Storage 刪除檔案
+    try {
+      const firebaseStorage = require('../services/firebaseStorage');
+      await firebaseStorage.deleteByUrl(photo.imageUrl);
+    } catch (e) {
+      // Storage 刪除失敗不阻擋 DB 刪除
+      if (process.env.NODE_ENV !== 'production') console.log('[Photo] Storage delete failed:', e.message);
+    }
+
+    // PhotoTag 因 onDelete: Cascade 會自動刪除
+    await prisma.photo.delete({ where: { id: photoId } });
+
+    res.json({ message: '已刪除照片' });
   } catch (err) {
     next(err);
   }

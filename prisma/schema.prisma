@@ -1,5 +1,6 @@
 generator client {
-  provider = "prisma-client-js"
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "debian-openssl-3.0.x"]
 }
 
 datasource db {
@@ -456,6 +457,7 @@ model PointRecord {
   @@index([memberId])
   @@index([eventId])
   @@index([expiresAt])
+  @@index([memberId, expiresAt])
 }
 
 enum PointType {
@@ -691,6 +693,12 @@ model Store {
   latitude    Float?
   longitude   Float?
   imageUrl    String?  // 店家照片
+  sortOrder   Int      @default(0)
+  website     String?  // 官方網站
+  promoUrl    String?  // 優惠頁面連結
+  promoDescription String? @db.Text  // 優惠說明
+  promoStartDate DateTime?  // 優惠開始日期
+  promoEndDate   DateTime?  // 優惠結束日期
   isActive    Boolean  @default(true)
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
@@ -710,6 +718,8 @@ model StoreOffer {
   description String?
   imageUrl    String?
   extraInfo   String?  @db.Text // 其他優惠資訊或圖片
+  sortOrder   Int      @default(0)
+  isActive    Boolean  @default(true)
   createdAt   DateTime @default(now())
 
   store Store @relation(fields: [storeId], references: [id], onDelete: Cascade)
@@ -856,8 +866,37 @@ model Vote {
 }
 
 // ============================================
+// 文件管理
+// ============================================
+
+model Document {
+  id          Int      @id @default(autoincrement())
+  fileName    String
+  fileType    String   // doc, csv, xls, pdf, rar, jpg, png
+  fileSize    Int      // bytes
+  fileUrl     String
+  description String?
+  sortOrder   Int      @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([sortOrder])
+  @@index([createdAt])
+}
+
+// ============================================
 // 審計日誌
 // ============================================
+
+// ============================================
+// 系統設定（key-value）
+// ============================================
+
+model SystemSetting {
+  key       String   @id           // 設定鍵名，如 "nameAnalysisEnabled"
+  value     String   @db.Text      // 設定值 JSON
+  updatedAt DateTime @updatedAt
+}
 
 model AuditLog {
   id         Int       @id @default(autoincrement())

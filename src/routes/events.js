@@ -5,6 +5,8 @@ const path = require('path');
 const prisma = require('../config/database');
 const { verifyToken, scopeByAdmin } = require('../middleware/auth');
 const { verifyEventEligibility } = require('../services/paymentVerification');
+const cloudinaryService = require('../services/cloudinaryService');
+const firebaseStorage = require('../services/firebaseStorage');
 
 const router = express.Router();
 
@@ -408,15 +410,11 @@ router.get('/:id/highlights', verifyToken, async (req, res, next) => {
   }
 });
 
-// 上傳活動花絮圖片（multer）
-const highlightStorage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, path.join(__dirname, '../../uploads/events')),
-  filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname);
-    cb(null, `highlight-${req.params.id}-${Date.now()}${ext}`);
-  },
+// 上傳活動花絮圖片（Cloudinary 雲端存儲）
+const uploadHighlight = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 2 * 1024 * 1024 },
 });
-const uploadHighlight = multer({ storage: highlightStorage, limits: { fileSize: 2 * 1024 * 1024 } });
 
 router.post('/:id/highlights', verifyToken, uploadHighlight.array('images', 50), async (req, res, next) => {
   try {
@@ -439,10 +437,13 @@ router.post('/:id/highlights', verifyToken, uploadHighlight.array('images', 50),
       return res.status(400).json({ error: '請選擇至少一張圖片' });
     }
 
+    // 上傳到 Cloudinary（自動壓縮+CDN）
+    const uploaded = await cloudinaryService.uploadHighlights(files, event.id);
+
     const highlights = await prisma.eventHighlight.createMany({
-      data: files.map((file, i) => ({
+      data: uploaded.map((result, i) => ({
         eventId: event.id,
-        imageUrl: `/uploads/events/${file.filename}`,
+        imageUrl: result.url,
         caption: captions[i] || null,
       })),
     });
@@ -456,6 +457,15 @@ router.post('/:id/highlights', verifyToken, uploadHighlight.array('images', 50),
 // 刪除花絮
 router.delete('/highlights/:highlightId', verifyToken, async (req, res, next) => {
   try {
+    const highlight = await prisma.eventHighlight.findUnique({
+      where: { id: parseInt(req.params.highlightId) },
+    });
+
+    if (highlight?.imageUrl) {
+      const publicId = cloudinaryService.extractPublicId(highlight.imageUrl);
+      if (publicId) await cloudinaryService.deleteFile(publicId);
+    }
+
     await prisma.eventHighlight.delete({
       where: { id: parseInt(req.params.highlightId) },
     });
@@ -466,15 +476,11 @@ router.delete('/highlights/:highlightId', verifyToken, async (req, res, next) =>
   }
 });
 
-// 上傳活動封面圖
-const coverStorage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, path.join(__dirname, '../../uploads/events')),
-  filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname);
-    cb(null, `event-${req.params.id}-${Date.now()}${ext}`);
-  },
+// 上傳活動封面圖（Firebase Storage）
+const uploadCover = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 },
 });
-const uploadCover = multer({ storage: coverStorage, limits: { fileSize: 5 * 1024 * 1024 } });
 
 router.post('/:id/cover', verifyToken, uploadCover.single('cover'), async (req, res, next) => {
   try {
@@ -482,7 +488,16 @@ router.post('/:id/cover', verifyToken, uploadCover.single('cover'), async (req, 
       return res.status(400).json({ error: '請選擇圖片' });
     }
 
-    const coverImage = `/uploads/events/${req.file.filename}`;
+    // 刪除舊封面
+    const oldEvent = await prisma.event.findUnique({ where: { id: parseInt(req.params.id) } });
+    if (oldEvent?.coverImage) await firebaseStorage.deleteByUrl(oldEvent.coverImage);
+
+    const coverImage = await firebaseStorage.uploadFile(
+      req.file,
+      'events/covers',
+      `event-${req.params.id}-${Date.now()}`
+    );
+
     const event = await prisma.event.update({
       where: { id: parseInt(req.params.id) },
       data: { coverImage },
@@ -494,16 +509,9 @@ router.post('/:id/cover', verifyToken, uploadCover.single('cover'), async (req, 
   }
 });
 
-// 上傳活動描述內嵌圖片（富文本編輯器用）
-const descImageStorage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, path.join(__dirname, '../../uploads/events')),
-  filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname);
-    cb(null, `desc-${req.params.id}-${Date.now()}${ext}`);
-  },
-});
+// 上傳活動描述內嵌圖片（Firebase Storage）
 const uploadDescImage = multer({
-  storage: descImageStorage,
+  storage: multer.memoryStorage(),
   limits: { fileSize: 5 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
     if (file.mimetype.startsWith('image/')) {
@@ -520,7 +528,11 @@ router.post('/:id/description-image', verifyToken, uploadDescImage.single('image
       return res.status(400).json({ error: '請選擇圖片' });
     }
 
-    const url = `/uploads/events/${req.file.filename}`;
+    const url = await firebaseStorage.uploadFile(
+      req.file,
+      'events/descriptions',
+      `desc-${req.params.id}-${Date.now()}`
+    );
     res.json({ url });
   } catch (err) {
     next(err);
